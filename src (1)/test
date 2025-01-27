@@ -1,0 +1,251 @@
+import pytest
+import asyncio
+from unittest.mock import Mock, MagicMock, patch
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
+
+class Product:
+    def __init__(self, id: int, name: str, price: float, stock: int):
+        self.id = id
+        self.name = name
+        self.price = price
+        self.stock = stock
+
+    def apply_discount(self, discount: float) -> None:
+        if not 0 <= discount <= 1:
+            raise ValueError("折扣必须在0到1之间")
+        self.price *= (1 - discount)
+
+class ShoppingCart:
+    def __init__(self):
+        self.items: Dict[int, Tuple[Product, int]] = {}  # {product_id: (product, quantity)}
+    
+    def add_item(self, product: Product, quantity: int=1) -> None:
+        if product.stock < quantity:
+            raise ValueError("库存不足")
+        
+        if product.id in self.items:
+            existing_product, existing_quantity = self.items[product.id]
+            self.items[product.id] = (existing_product, existing_quantity + quantity)
+        else:
+            self.items[product.id] = (product, quantity)
+    
+    def remove_item(self, product_id: int, quantity: int=1) -> None:
+        if product_id not in self.items:
+            raise KeyError("商品不存在于购物车中")
+        
+        product, existing_quantity = self.items[product_id]
+        if existing_quantity <= quantity:
+            del self.items[product_id]
+        else:
+            self.items[product_id] = (product, existing_quantity - quantity)
+    
+    @property
+    def total_price(self) -> float:
+        return sum(product.price * quantity for product, quantity in self.items.values())
+    
+    def checkout(self, payment_gateway) -> bool:
+        total = self.total_price
+        if payment_gateway.process_payment(total):
+            for product, quantity in self.items.values():
+                product.stock -= quantity
+            self.items.clear()
+            return True
+        return False
+
+class PaymentGateway:
+    def process_payment(self, amount: float) -> bool:
+        """模拟支付处理，实际应调用外部API"""
+        raise NotImplementedError
+
+@pytest.fixture(scope="module")
+def sample_products() -> List[Product]:
+    """模块级fixture：创建测试用商品"""
+    return [
+        Product(1, "Python编程书", 99.99, 10),
+        Product(2, "咖啡杯", 19.95, 50),
+        Product(3, "无线鼠标", 49.50, 20)
+    ]
+
+@pytest.fixture
+def empty_cart() -> ShoppingCart:
+    """函数级fixture：空购物车"""
+    return ShoppingCart()
+
+@pytest.fixture
+def mock_payment_gateway() -> Mock:
+    """模拟支付网关"""
+    gateway = Mock(spec=PaymentGateway)
+    gateway.process_payment.return_value = True
+    return gateway
+
+class TestShoppingCartBasic:
+    """基础功能测试"""
+    
+    def test_add_item(self, empty_cart, sample_products):
+        cart = empty_cart
+        product = sample_products[0]
+        cart.add_item(product, 2)
+        assert len(cart.items) == 1
+        assert cart.items[1][1] == 2
+    
+    def test_remove_item(self, empty_cart, sample_products):
+        cart = empty_cart
+        product = sample_products[0]
+        cart.add_item(product, 3)
+        cart.remove_item(1, 2)
+        assert cart.items[1][1] == 1
+    
+    @pytest.mark.parametrize("quantity, expected", [
+        (5, 5*99.99),
+        (3, 3*99.99),
+        (0, 0)
+    ])
+    def test_total_price(self, empty_cart, sample_products, quantity, expected):
+        cart = empty_cart
+        if quantity > 0:
+            cart.add_item(sample_products[0], quantity)
+        assert cart.total_price == pytest.approx(expected, rel=1e-3)
+
+class TestCheckoutProcess:
+    """结账流程测试"""
+    
+    @pytest.mark.usefixtures("mock_payment_gateway")
+    def test_successful_checkout(self, empty_cart, sample_products, mock_payment_gateway):
+        cart = empty_cart
+        product = sample_products[0]
+        initial_stock = product.stock
+        
+        cart.add_item(product, 2)
+        result = cart.checkout(mock_payment_gateway)
+        
+        assert result is True
+        assert len(cart.items) == 0
+        assert product.stock == initial_stock - 2
+        mock_payment_gateway.process_payment.assert_called_once_with(pytest.approx(2*99.99, rel=1e-3))
+    
+    def test_checkout_failure(self, empty_cart, sample_products):
+        cart = empty_cart
+        product = sample_products[0]
+        initial_stock = product.stock
+        
+        cart.add_item(product, 2)
+        
+        # 使用mock模拟支付失败
+        mock_payment = Mock()
+        mock_payment.process_payment.return_value = False
+        
+        result = cart.checkout(mock_payment)
+        
+        assert result is False
+        assert len(cart.items) == 2
+        assert product.stock == initial_stock
+
+class TestEdgeCases:
+    """边界条件测试"""
+    
+    @pytest.mark.parametrize("discount, expected_price", [
+        (0.1, 89.991),
+        (0.5, 49.995),
+        (0, 99.99)
+    ])
+    def test_product_discount(self, sample_products, discount, expected_price):
+        product = sample_products[0]
+        original_price = product.price
+        product.apply_discount(discount)
+        assert product.price == pytest.approx(expected_price, rel=1e-3)
+        product.price = original_price  # 重置状态
+    
+    @pytest.mark.parametrize("invalid_discount", [
+        -0.1, 1.1, 2.0
+    ])
+    def test_invalid_discount(self, sample_products, invalid_discount):
+        product = sample_products[0]
+        with pytest.raises(ValueError) as excinfo:
+            product.apply_discount(invalid_discount)
+        assert "折扣必须在0到1之间" in str(excinfo.value)
+
+# ---------- 异步测试 ----------
+@pytest.mark.asyncio
+class TestAsyncOperations:
+    """异步功能测试"""
+    
+    async def async_fetch_data(self) -> dict:
+        await asyncio.sleep(0.1)
+        return {"status": "success", "data": [1, 2, 3]}
+    
+    @pytest.mark.parametrize("expected_length", [3])
+    async def test_async_data_fetching(self, expected_length):
+        data = await self.async_fetch_data()
+        assert data["status"] == "success"
+        assert len(data["data"]) == expected_length
+
+class TestPaymentIntegration:
+    """支付集成测试"""
+    
+    @patch("builtins.print")
+    def test_payment_logging(self, mock_print, mock_payment_gateway):
+        mock_payment_gateway.process_payment.return_value = True
+        cart = ShoppingCart()
+        cart.checkout(mock_payment_gateway)
+        mock_print.assert_called_with("支付处理中...")
+
+@pytest.mark.skipif(
+    datetime.today().weekday() >= 5,
+    reason="只在工作日运行"
+)
+def test_weekday_only_operation():
+    """使用skipif插件条件跳过测试"""
+    assert datetime.today().weekday() < 5
+
+@pytest.mark.slow
+class TestSlowOperations:
+    """标记为慢速测试"""
+    
+    @pytest.mark.timeout(5)
+    def test_large_inventory(self):
+        """测试大量库存操作"""
+        cart = ShoppingCart()
+        product = Product(4, "测试商品", 10.0, 10000)
+        for _ in range(10000):
+            cart.add_item(product)
+        assert cart.total_price == 10000 * 10.0
+
+@pytest.fixture
+def configured_cart(sample_products) -> ShoppingCart:
+    """配置好的购物车"""
+    cart = ShoppingCart()
+    for product in sample_products:
+        cart.add_item(product, 2)
+    return cart
+
+def test_configured_cart_total(configured_cart):
+    assert configured_cart.total_price == pytest.approx(2*(99.99 + 19.95 + 49.50), rel=1e-3)
+
+def test_full_coverage_example():
+    """用于覆盖边界条件的测试"""
+    product = Product(5, "临时商品", 0.0, 0)
+    assert product.price == 0.0
+    with pytest.raises(ValueError):
+        product.apply_discount(0.5)
+
+@pytest.mark.parametrize("product_id, quantity, expected_error", [
+    (999, 1, KeyError),
+    (1, 100, ValueError),
+    (2, -1, ValueError)
+])
+def test_invalid_operations(empty_cart, sample_products, product_id, quantity, expected_error):
+    cart = empty_cart
+    product_map = {p.id: p for p in sample_products}
+    
+    if product_id in product_map:
+        cart.add_item(product_map[product_id], 1)  # 先添加有效商品
+    
+    with pytest.raises(expected_error):
+        if expected_error == KeyError:
+            cart.remove_item(product_id, quantity)
+        else:
+            cart.add_item(product_map[product_id], quantity)
+
+if __name__ == "__main__":
+    pytest.main(["-v", "--cov=.", "--cov-report=html", "--slow"])
